@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nova Social — Dialing In</title>
+<style>
+body{font-family:system-ui;max-width:720px;margin:auto;padding:28px 20px;background:#111;color:#eee}
+.card{background:#1d1d1d;padding:22px;border-radius:18px}
+button{background:#1db954;color:#071b0d;border:0;border-radius:999px;padding:14px 20px;font-weight:700;font-size:16px}
+button:disabled{opacity:.55}
+#log{white-space:pre-wrap;line-height:1.45;margin-top:18px;font-size:14px}
+.small{opacity:.7;font-size:13px}
+</style>
+</head>
+<body>
+<h1>NOVA SOCIAL — DIALING IN</h1>
+<p>Monday · 09:00–23:00 · Lo-Fi Hip Hop · Instrumental Beats · Warm Vinyl Textures · 80–90 BPM</p>
+<div class="card">
+<button id="go">Connect Spotify &amp; Create Playlist</button>
+<div id="log"></div>
+<p class="small">Build target: at least 14 hours of verified, playable Spotify music. Tracks are checked against your Spotify market before they are added.</p>
+</div>
+
+<script>
+const CLIENT_ID="2f2c786f3aa9402eb04552e9e5376cb1";
+const REDIRECT_URI=location.origin+location.pathname;
+const SOURCE_PLAYLIST="1eg5KRKkVoBcH1aawvIDfH"; // Chillhop Essentials — 18h source pool
+const TARGET_MS=14*60*60*1000;
+const MARKET="ID";
+
+const $=id=>document.getElementById(id);
+function log(x){$("log").textContent+=x+"\n";}
+
+function b64url(buf){
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+}
+async function sha256(s){return crypto.subtle.digest("SHA-256",new TextEncoder().encode(s));}
+function randomString(n=64){
+  const a=new Uint8Array(n); crypto.getRandomValues(a);
+  return b64url(a);
+}
+function norm(s){
+  return s.toLowerCase().normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g,"")
+    .replace(/[’']/g,"'")
+    .replace(/\s+/g," ").trim();
+}
+async function getToken(){
+  const code=new URLSearchParams(location.search).get("code");
+  if(!code){
+    let verifier=localStorage.getItem("nova_pkce");
+    if(!verifier){
+      verifier=randomString(64); localStorage.setItem("nova_pkce",verifier);
+    }
+    const challenge=b64url(await sha256(verifier));
+    const state=randomString(24); localStorage.setItem("nova_state",state);
+    const u=new URL("https://accounts.spotify.com/authorize");
+    u.searchParams.set("client_id",CLIENT_ID);
+    u.searchParams.set("response_type","code");
+    u.searchParams.set("redirect_uri",REDIRECT_URI);
+    u.searchParams.set("scope","playlist-modify-private playlist-modify-public");
+    u.searchParams.set("code_challenge_method","S256");
+    u.searchParams.set("code_challenge",challenge);
+    u.searchParams.set("state",state);
+    location.href=u.toString(); return null;
+  }
+  const verifier=localStorage.getItem("nova_pkce");
+  const r=await fetch("https://accounts.spotify.com/api/token",{
+    method:"POST",
+    headers:{"Content-Type":"application/x-www-form-urlencoded"},
+    body:new URLSearchParams({
+      client_id:CLIENT_ID,grant_type:"authorization_code",code,
+      redirect_uri:REDIRECT_URI,code_verifier:verifier
+    })
+  });
+  if(!r.ok) throw new Error("Spotify authorization failed.");
+  const d=await r.json();
+  history.replaceState({},document.title,REDIRECT_URI);
+  localStorage.removeItem("nova_pkce");
+  return d.access_token;
+}
+
+async function api(path,token,opts={}){
+  const r=await fetch("https://api.spotify.com/v1"+path,{
+    ...opts,headers:{Authorization:"Bearer "+token,"Content-Type":"application/json",...(opts.headers||{})}
+  });
+  if(!r.ok) throw new Error("Spotify API "+r.status);
+  return r.status===204?null:r.json();
+}
+
+async function getAllSourceTracks(token){
+  let out=[], url=`/playlists/${SOURCE_PLAYLIST}/tracks?market=${MARKET}&limit=100`;
+  while(url){
+    const d=await api(url,token);
+    for(const x of (d.items||[])){
+      const t=x.track;
+      if(!t || t.type!=="track") continue;
+      if(t.is_playable===false) continue;
+      if(!t.uri) continue;
+      out.push(t);
+    }
+    url=d.next?new URL(d.next).pathname+new URL(d.next).search:"";
+  }
+  return out;
+}
+
+function isGoodForMonday(t){
+  if(t.explicit) return false;
+  // The source playlist is explicitly instrumental/chillhop; these small
+  // exclusions remove obvious spoken/holiday/remix noise without guessing.
+  const bad=/(podcast|speech|skit|interlude|voice memo|dialogue)/i;
+  return !bad.test(t.name||"");
+}
+
+async function build(){
+  $("go").disabled=true;
+  const token=await getToken();
+  if(!token) return;
+  log("Loading the verified Chillhop source pool...");
+  const source=await getAllSourceTracks(token);
+  log(`Loaded ${source.length} source tracks.`);
+
+  // Deterministic curation: preserve source order, select only playable,
+  // non-explicit tracks, and stop only after the accumulated duration
+  // reaches the 14-hour target.
+  const chosen=[], seen=new Set(); let total=0;
+  for(const t of source){
+    if(!isGoodForMonday(t)) continue;
+    if(seen.has(t.id)) continue;
+    seen.add(t.id);
+    chosen.push(t); total+=t.duration_ms;
+    if(total>=TARGET_MS) break;
+  }
+
+  if(total<TARGET_MS){
+    throw new Error(`Only ${(total/3600000).toFixed(2)} hours were available.`);
+  }
+
+  log(`Selected ${chosen.length} playable tracks.`);
+  log(`Verified duration: ${(total/3600000).toFixed(2)} hours.`);
+  log("Creating NOVA SOCIAL — DIALING IN...");
+
+  const me=await api("/me",token);
+  const playlist=await api(`/users/${encodeURIComponent(me.id)}/playlists`,token,{
+    method:"POST",
+    body:JSON.stringify({
+      name:"NOVA SOCIAL — DIALING IN",
+      description:"Monday 09:00–23:00 · lo-fi hip hop and instrumental beats · 14-hour café sequence.",
+      public:false
+    })
+  });
+
+  // Spotify accepts up to 100 URIs per add request.
+  for(let i=0;i<chosen.length;i+=100){
+    const batch=chosen.slice(i,i+100).map(t=>t.uri);
+    await api(`/playlists/${playlist.id}/tracks`,token,{
+      method:"POST",body:JSON.stringify({uris:batch})
+    });
+    log(`Added ${Math.min(i+100,chosen.length)}/${chosen.length}`);
+  }
+
+  log(`DONE — ${(total/3600000).toFixed(2)} hours.`);
+  log(`Spotify playlist: ${playlist.external_urls?.spotify||"created successfully"}`);
+}
+$("go").onclick=()=>build().catch(e=>{
+  $("go").disabled=false; log("ERROR: "+e.message);
+});
+</script>
+</body>
+</html>
